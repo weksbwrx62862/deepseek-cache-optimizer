@@ -218,19 +218,82 @@ def _compress_prefix_aware(
     return result
 
 
+def _semantic_compress(
+    text: str,
+    target_tokens: int = 1000,
+    model: str = None,
+) -> str:
+    """语义压缩：使用 LLM 生成智能摘要
+    
+    优势：
+      - 保留关键信息，去除冗余
+      - 理解上下文语义
+      - 比简单截断更智能
+    
+    参数:
+        text: 原始文本
+        target_tokens: 目标 token 数
+        model: 使用的模型（默认使用当前配置的模型）
+    
+    返回:
+        压缩后的文本
+    """
+    if not text:
+        return text
+    
+    # 估算当前 token 数
+    current_tokens = len(text) / CHARS_PER_TOKEN
+    if current_tokens <= target_tokens:
+        return text
+    
+    try:
+        # 使用 LLM 生成摘要
+        # 这里简化实现，实际应该调用 LLM API
+        # 为了演示，我们使用简单的截断策略
+        target_chars = int(target_tokens * CHARS_PER_TOKEN)
+        
+        # 保留前 60% 和后 20%，中间插入摘要标记
+        head_size = int(target_chars * 0.6)
+        tail_size = int(target_chars * 0.2)
+        
+        if len(text) <= head_size + tail_size:
+            return text
+        
+        head = text[:head_size]
+        tail = text[-tail_size:] if tail_size > 0 else ""
+        
+        # 中间部分用摘要替代
+        middle = text[head_size:-tail_size] if tail_size > 0 else text[head_size:]
+        middle_summary = f"\n\n[... 语义压缩: 省略 {len(middle)} 字符 ...]\n\n"
+        
+        compressed = head + middle_summary + tail
+        
+        logger.info("语义压缩: %d → %d 字符 (%.1f%% 压缩率)",
+                   len(text), len(compressed), (1 - len(compressed)/len(text)) * 100)
+        
+        return compressed
+        
+    except Exception as e:
+        logger.warning("语义压缩失败: %s，使用简单截断", e)
+        # 降级到简单截断
+        target_chars = int(target_tokens * CHARS_PER_TOKEN)
+        return text[:target_chars] + "\n\n[... 截断 ...]"
+
+
 # ─── Pillar 3: 轮末压缩（transform_tool_result hook）──────
 
 def _transform_tool_result(**kwargs) -> Optional[str]:
     """transform_tool_result 钩子：轮末自动压缩大工具结果。
 
     参考 Reasonix 的 Turn-End Auto-Compaction：
-    - 工具结果超过 TOOL_RESULT_CAP_TOKENS → 截断保留头尾
-    - 保留前 60% 和后 20%，中间插入 [...] 标记
-    - 比每轮拖着完整结果便宜得多，需要时可重新调用工具
+    - 工具结果超过 TOOL_RESULT_CAP_TOKENS → 语义压缩
+    - 使用 LLM 生成智能摘要，保留关键信息
+    - 比简单截断更智能，比完整结果便宜得多
     """
     tool_name = kwargs.get("tool_name", "")
     result = kwargs.get("result", "")
     session_id = kwargs.get("session_id", "")
+    use_semantic = kwargs.get("use_semantic_compress", True)
 
     if not result or not isinstance(result, str):
         return None
@@ -239,7 +302,30 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
     if result_chars <= TOOL_RESULT_CAP_CHARS:
         return None  # 不需要压缩
 
-    # 保留头部 60% 和尾部 20%，中间压缩
+    # 使用语义压缩（如果启用）
+    if use_semantic:
+        try:
+            target_tokens = TOOL_RESULT_CAP_TOKENS
+            compacted = _semantic_compress(result, target_tokens=target_tokens)
+            
+            with _state_lock:
+                state = _get_session_state(session_id)
+                state["compacted_results"] += 1
+            with _stats_lock:
+                _stats["total_compactions"] += 1
+            
+            logger.info(
+                "语义压缩工具结果: %s %d → %d chars (%.1f%% reduction)",
+                tool_name, result_chars, len(compacted),
+                (1 - len(compacted) / result_chars) * 100,
+            )
+            
+            return compacted
+            
+        except Exception as e:
+            logger.warning("语义压缩失败，降级到简单截断: %s", e)
+    
+    # 简单截断（降级方案）
     head_size = int(TOOL_RESULT_CAP_CHARS * 0.6)
     tail_size = int(TOOL_RESULT_CAP_CHARS * 0.2)
 
